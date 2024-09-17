@@ -1,0 +1,109 @@
+name: Deploy Helm Chart to AKS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+      CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+      TF_CLI_CONFIG_FILE: ${{ secrets.TERRAFORM_CLOUD_TOKEN }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+    steps:
+
+      # 1. Instalar Terraform, yq y jq
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.11
+
+      - name: Instalar yq, jq, y Helm
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y jq
+            sudo wget https://github.com/mikefarah/yq/releases/download/v4.16.1/yq_linux_amd64 -O /usr/local/bin/yq
+            sudo chmod +x /usr/local/bin/yq
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash  # Instalar Helm
+
+      # 1. Leer las variables desde el archivo YAML
+      - name: Leer variables desde el archivo YAML
+        id: load_variables
+        run: |
+          echo "TERRAFORM_REPO=$(yq '.variables.terraform_repo' variables.yml)" >> $GITHUB_ENV
+          echo "TERRAFORM_PATH=$(yq '.variables.terraform_path' variables.yml)" >> $GITHUB_ENV
+          echo "INSTANCE_ACR=$(yq '.variables.instance_acr' variables.yml)" >> $GITHUB_ENV
+          echo "CHART_NAME=$(yq '.variables.chart_name' variables.yml)" >> $GITHUB_ENV
+          echo "RELEASE_NAME=$(yq '.variables.release_name' variables.yml)" >> $GITHUB_ENV
+
+      # 2. Clonar el repositorio que contiene el proyecto completo de Terraform
+      - name: Checkout Terraform Project
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.TERRAFORM_REPO }}
+          path: ${{ env.TERRAFORM_PATH }}
+
+      # 3. Ejecutar el proyecto de Terraform clonado
+      - name: Run Terraform Project
+        run: |
+          cd ${{ env.TERRAFORM_PATH }}
+          terraform init
+          terraform apply -auto-approve
+
+      # 4. Autenticación en Azure usando los secrets almacenados
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 5. Obtener credenciales del clúster AKS
+      - name: Set AKS Context
+        run: |
+          echo "Obteniendo credenciales para el clúster AKS..."
+          az aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME
+        continue-on-error: false  # El workflow falla si no se obtienen las credenciales
+
+      # 6. Verificar el estado del clúster
+      - name: Verificar estado del clúster
+        run: |
+          echo "Verificando el estado del clúster AKS..."
+          kubectl cluster-info
+          kubectl get nodes
+        continue-on-error: false
+
+      # 7. Autenticarse en el ACR de instancia
+      - name: Login to ACR
+        run: |
+          echo "Autenticando en el ACR de instancia $INSTANCE_ACR..."
+          az acr login --name $INSTANCE_ACR
+        continue-on-error: false
+        
+      # 8. Obtener la última versión del chart disponible en el ACR
+      - name: Obtener la última versión del chart
+        id: get_chart_version
+        run: |
+          echo "Obteniendo la última versión del chart $CHART_NAME desde $INSTANCE_ACR..."
+          LATEST_VERSION=$(helm search repo oci://$INSTANCE_ACR/$CHART_NAME --devel -o json | jq -r '.[0].version')
+          echo "La última versión es $LATEST_VERSION"
+          echo "CHART_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
+        continue-on-error: false
+
+      # 9. Instalar o actualizar el Helm chart en AKS
+      - name: Deploy Helm Chart to AKS
+        run: |
+          echo "Desplegando el chart $CHART_NAME:$CHART_VERSION en AKS..."
+          helm upgrade --install $RELEASE_NAME oci://$INSTANCE_ACR/$CHART_NAME --version $CHART_VERSION
+        continue-on-error: false
+
+      # 10. Verificar el estado del despliegue
+      - name: Verificar el despliegue en AKS
+        run: |
+          echo "Verificando el estado del despliegue..."
+          kubectl get pods --namespace default
+        continue-on-error: false

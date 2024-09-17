@@ -1,0 +1,6 @@
+variables:
+  terraform_repo: your-github-username/your-terraform-repo
+  terraform_path: terraform-project
+  instance_acr: "instsance.azurecr.io"
+  chart_name: "ping"
+  release_name: "ping" 
